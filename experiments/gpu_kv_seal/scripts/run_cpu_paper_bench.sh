@@ -2,6 +2,13 @@
 
 set -euo pipefail
 
+CONFKV_ROOT="$(
+    cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
+    pwd
+)"
+
+source "$CONFKV_ROOT/env.sh"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$ROOT/../.." && pwd)"
 
@@ -60,10 +67,10 @@ uptime \
 cat /sys/kernel/mm/transparent_hugepage/enabled \
     > "$OUT/meta/thp.txt" 2>/dev/null || true
 
-python -m pip freeze \
+"$PYTHON_BIN" -m pip freeze \
     > "$OUT/meta/pip_freeze.txt"
 
-python - <<'PY' > "$OUT/meta/python_packages.txt"
+"$PYTHON_BIN" - <<'PY' > "$OUT/meta/python_packages.txt"
 import cryptography
 import torch
 
@@ -114,7 +121,7 @@ for mode in $MODES; do
             numactl \
                 --physcpubind="$CPU_CORE" \
                 --membind="$NUMA_NODE" \
-                python "$BENCH" \
+                "$PYTHON_BIN" "$BENCH" \
                     --mode "$mode" \
                     --size-mib "$size" \
                     --warmup "$WARMUP" \
@@ -131,7 +138,7 @@ done
 # Summary
 # ----------------------------------------------------------------------
 
-python "$ROOT/scripts/summarize_results.py" \
+"$PYTHON_BIN" "$ROOT/scripts/summarize_results.py" \
     --raw-dir "$OUT/raw" \
     --output-dir "$OUT"
 

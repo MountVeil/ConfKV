@@ -130,7 +130,7 @@ Once an H100 is available to CUDA:
 
 After all correctness/security gates pass:
 
-    python experiments/gpu_kv_seal/scripts/bench_gpu_aesgcm.py
+    python3 experiments/gpu_kv_seal/scripts/bench_gpu_aesgcm.py
 
 ## License
 
