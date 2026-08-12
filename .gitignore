@@ -26,3 +26,6 @@ experiments/gpu_kv_seal/results/
 .vscode/
 .idea/
 .DS_Store
+
+# Local analysis / integration traces
+analysis/
