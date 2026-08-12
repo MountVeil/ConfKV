@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Native build artifacts
+*.so
+*.o
+*.a
+
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# ConfKV experiment artifacts
+experiments/gpu_kv_seal/archive/
+experiments/gpu_kv_seal/results/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

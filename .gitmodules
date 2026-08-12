@@ -1,0 +1,4 @@
+[submodule "LMCache"]
+	path = LMCache
+	url = https://github.com/MountVeil/LMCache.git
+	branch = confkv

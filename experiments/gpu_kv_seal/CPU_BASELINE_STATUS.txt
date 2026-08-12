@@ -1,0 +1,47 @@
+GPU KV Seal - CPU Baseline Checkpoint
+=====================================
+
+LMCache baseline commit:
+3031f71e66f8872f8c763544e6ad4a654e566629
+
+Paper benchmark:
+results/paper/20260812_101801
+
+Security:
+PASS native seal -> stock LMCache open
+PASS stock LMCache seal -> native open
+PASS wrong-key rejection
+PASS ciphertext tamper rejection
+PASS tag tamper rejection
+PASS IV tamper rejection
+PASS failure-path plaintext zeroization
+
+LMCache integration:
+PASS Serializer/Deserializer API
+PASS Serde factory
+PASS AsyncSerdeProcessor serialize
+PASS AsyncSerdeProcessor deserialize
+PASS async tamper rejection
+
+Representative CPU results:
+
+18 MiB:
+  stock seal  = 12.940 ms
+  optcpu seal = 1.008 ms
+  stock open  = 20.054 ms
+  optcpu open = 1.009 ms
+
+36 MiB:
+  stock seal  = 32.465 ms
+  optcpu seal = 2.441 ms
+  stock open  = 52.148 ms
+  optcpu open = 2.430 ms
+
+72 MiB:
+  stock seal  = 74.109 ms
+  optcpu seal = 9.840 ms
+  stock open  = 107.019 ms
+  optcpu open = 9.747 ms
+
+Status:
+CPU-only preparation COMPLETE.
