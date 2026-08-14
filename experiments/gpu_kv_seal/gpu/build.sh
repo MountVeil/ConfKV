@@ -2,17 +2,22 @@
 set -euo pipefail
 
 ROOT="$(
-  cd "$(dirname "${BASH_SOURCE[0]}")"
-  pwd
+    cd "$(dirname "${BASH_SOURCE[0]}")"
+    pwd
 )"
 
 NVCC="${NVCC:-nvcc}"
 
 if ! command -v "$NVCC" >/dev/null 2>&1; then
-    echo "nvcc not found."
-    echo "Set NVCC=/path/to/nvcc when CUDA toolkit is available."
+    echo "ERROR: nvcc not found."
+    echo "Set NVCC=/path/to/nvcc."
     exit 1
 fi
+
+echo "========================================"
+echo " ConfKV GPU AES-GCM build"
+echo " Target: NVIDIA H100 / Hopper SM90"
+echo "========================================"
 
 "$NVCC" \
     -O3 \
@@ -27,5 +32,5 @@ fi
     -o "$ROOT/libgpu_aesgcm.so"
 
 echo
-echo "Built:"
+echo "Built H100/SM90 library:"
 ls -lh "$ROOT/libgpu_aesgcm.so"

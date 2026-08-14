@@ -151,10 +151,27 @@ class GpuAes128GcmKey:
     def __init__(
         self,
         library: GpuAesGcmLibrary,
-        key: bytes,
+        key: bytes | bytearray | memoryview,
         device: int = 0,
     ):
-        if len(key) != KEY_LEN:
+        """
+        Provision one raw AES-128 K_store into the GPU.
+
+        For the production ConfKV path, pass a mutable bytearray so
+        ctypes can expose the TDX-side buffer directly without creating
+        another Python-owned key copy.
+
+        Immutable bytes are still accepted for tests.  In that case a
+        temporary mutable copy is created and explicitly erased after
+        native key_create returns.
+        """
+        key_view = memoryview(
+            key
+        ).cast("B")
+
+        if key_view.nbytes != KEY_LEN:
+            key_view.release()
+
             raise ValueError(
                 "AES-128 key must be exactly 16 bytes"
             )
@@ -163,20 +180,63 @@ class GpuAes128GcmKey:
         self.device = int(device)
         self._handle = ctypes.c_void_p()
 
-        KeyArray = ctypes.c_uint8 * KEY_LEN
-        key_buf = KeyArray.from_buffer_copy(
-            key
+        KeyArray = (
+            ctypes.c_uint8
+            * KEY_LEN
         )
 
-        rc = (
-            library.lib
-            .lmcache_gpu_aes128gcm_key_create(
-                key_buf,
-                KEY_LEN,
-                self.device,
-                ctypes.byref(self._handle),
+        temporary_copy = None
+
+        try:
+            if key_view.readonly:
+                temporary_copy = bytearray(
+                    key_view
+                )
+
+                key_buf = (
+                    KeyArray
+                    .from_buffer(
+                        temporary_copy
+                    )
+                )
+            else:
+                key_buf = (
+                    KeyArray
+                    .from_buffer(
+                        key_view
+                    )
+                )
+
+            rc = (
+                library.lib
+                .lmcache_gpu_aes128gcm_key_create(
+                    key_buf,
+                    KEY_LEN,
+                    self.device,
+                    ctypes.byref(
+                        self._handle
+                    ),
+                )
             )
-        )
+
+        finally:
+            if temporary_copy is not None:
+                tmp_array = (
+                    ctypes.c_uint8
+                    * len(temporary_copy)
+                ).from_buffer(
+                    temporary_copy
+                )
+
+                ctypes.memset(
+                    ctypes.addressof(
+                        tmp_array
+                    ),
+                    0,
+                    len(temporary_copy),
+                )
+
+            key_view.release()
 
         library.check(
             rc,

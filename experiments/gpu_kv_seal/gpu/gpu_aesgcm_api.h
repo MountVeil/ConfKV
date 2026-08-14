@@ -21,6 +21,31 @@ size_t lmcache_gpu_aesgcm_frame_size(
     size_t plaintext_len
 );
 
+/*
+ * Provision one raw AES-128 K_store into the target GPU.
+ *
+ * key:
+ *   HOST pointer to exactly 16 raw key bytes.
+ *
+ * Target ConfKV deployment:
+ *
+ *   TDX guest
+ *       -> raw K_store
+ *       -> CUDA H2D
+ *       -> H100 temporary raw-key buffer
+ *       -> GPU-side AES key expansion
+ *       -> GPU round-key state
+ *
+ * The raw GPU key buffer is explicitly zeroized before this function
+ * returns.  The caller may therefore erase its mutable host K_store
+ * immediately after successful return.
+ *
+ * In H100 CC-On, protection of the CPU-TEE <-> GPU CUDA transfer is
+ * provided transparently by NVIDIA's confidential-computing stack.
+ * ConfKV does not obtain or manipulate the SPDM transport/session key.
+ *
+ * key_create is synchronous with respect to key provisioning.
+ */
 int lmcache_gpu_aes128gcm_key_create(
     const uint8_t* key,
     size_t key_len,
@@ -28,6 +53,9 @@ int lmcache_gpu_aes128gcm_key_create(
     lmcache_gpu_aesgcm_key_t* out
 );
 
+/*
+ * Erase GPU key-derived state and release the key handle.
+ */
 int lmcache_gpu_aes128gcm_key_destroy(
     lmcache_gpu_aesgcm_key_t key
 );

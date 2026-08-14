@@ -291,8 +291,8 @@ inline Block128 gf_pow_from_table(
  * AES-128
  * ================================================================ */
 
-__host__
-inline uint8_t host_xtime(uint8_t x)
+__device__
+inline uint8_t xtime(uint8_t x)
 {
     return static_cast<uint8_t>(
         (x << 1)
@@ -301,15 +301,39 @@ inline uint8_t host_xtime(uint8_t x)
 }
 
 
-void expand_aes128_key(
-    const uint8_t key[16],
-    uint8_t round_keys[AES_ROUND_KEY_BYTES])
+/*
+ * Expand the raw AES-128 K_store entirely on the GPU.
+ *
+ * ConfKV provisioning model:
+ *
+ *   TDX guest raw K_store (16 B)
+ *       -> CUDA H2D
+ *       -> GPU temporary raw key
+ *       -> this kernel
+ *       -> GPU round-key schedule (176 B)
+ *
+ * In H100 CC-On, the H2D transfer is protected by NVIDIA's
+ * confidential-computing transport below the CUDA application API.
+ *
+ * Only one thread is needed because key setup happens once per key
+ * lifecycle, not once per KV chunk.
+ */
+__global__
+void expand_aes128_key_kernel(
+    const uint8_t* key,
+    uint8_t* round_keys)
 {
-    std::memcpy(
-        round_keys,
-        key,
-        16
-    );
+    if (
+        blockIdx.x != 0
+        || threadIdx.x != 0
+    ) {
+        return;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        round_keys[i] = key[i];
+    }
 
     int generated = 16;
     uint8_t rcon = 1;
@@ -320,6 +344,7 @@ void expand_aes128_key(
         < AES_ROUND_KEY_BYTES
     ) {
 
+        #pragma unroll
         for (int i = 0; i < 4; ++i) {
             temp[i] =
                 round_keys[
@@ -336,20 +361,24 @@ void expand_aes128_key(
                 temp[0];
 
             temp[0] =
-                HOST_SBOX[temp[1]];
+                DEVICE_SBOX[temp[1]];
+
             temp[1] =
-                HOST_SBOX[temp[2]];
+                DEVICE_SBOX[temp[2]];
+
             temp[2] =
-                HOST_SBOX[temp[3]];
+                DEVICE_SBOX[temp[3]];
+
             temp[3] =
-                HOST_SBOX[t];
+                DEVICE_SBOX[t];
 
             temp[0] ^= rcon;
 
             rcon =
-                host_xtime(rcon);
+                xtime(rcon);
         }
 
+        #pragma unroll
         for (int i = 0; i < 4; ++i) {
 
             round_keys[generated] =
@@ -364,13 +393,27 @@ void expand_aes128_key(
 }
 
 
-__device__
-inline uint8_t xtime(uint8_t x)
+/*
+ * Explicitly erase temporary secret material in device memory.
+ *
+ * This is used for the raw 16-byte K_store after GPU-side
+ * key expansion.
+ */
+__global__
+void zeroize_bytes_kernel(
+    uint8_t* ptr,
+    size_t len)
 {
-    return static_cast<uint8_t>(
-        (x << 1)
-        ^ ((x & 0x80) ? 0x1b : 0)
-    );
+    const size_t i =
+        static_cast<size_t>(
+            blockIdx.x
+        )
+        * blockDim.x
+        + threadIdx.x;
+
+    if (i < len) {
+        ptr[i] = 0;
+    }
 }
 
 
@@ -1292,6 +1335,8 @@ int lmcache_gpu_aes128gcm_key_create(
         return LMCACHE_GPU_AESGCM_ERR_ARGUMENT;
     }
 
+    *out = nullptr;
+
     DeviceGuard guard(device);
 
     auto* h =
@@ -1305,15 +1350,65 @@ int lmcache_gpu_aes128gcm_key_create(
 
     h->device = device;
 
-    uint8_t round_keys[
-        AES_ROUND_KEY_BYTES
-    ];
+    uint8_t* d_raw_key = nullptr;
 
-    expand_aes128_key(
-        key,
-        round_keys
-    );
+    /*
+     * Best-effort cleanup for every failed provisioning path.
+     *
+     * Both the raw GPU key and derived GPU round keys are secret
+     * material and are erased before their allocations are released.
+     */
+    auto cleanup_failure = [&]() {
 
+        if (d_raw_key != nullptr) {
+            cudaMemset(
+                d_raw_key,
+                0,
+                16
+            );
+
+            cudaFree(
+                d_raw_key
+            );
+
+            d_raw_key = nullptr;
+        }
+
+        if (h->d_h_pow2 != nullptr) {
+            cudaMemset(
+                h->d_h_pow2,
+                0,
+                sizeof(Block128) * 64
+            );
+
+            cudaFree(
+                h->d_h_pow2
+            );
+
+            h->d_h_pow2 = nullptr;
+        }
+
+        if (h->d_round_keys != nullptr) {
+            cudaMemset(
+                h->d_round_keys,
+                0,
+                AES_ROUND_KEY_BYTES
+            );
+
+            cudaFree(
+                h->d_round_keys
+            );
+
+            h->d_round_keys = nullptr;
+        }
+
+        delete h;
+    };
+
+    /*
+     * DEVICE_SBOX is constant GPU state used by both AES encryption
+     * and the GPU-side key-expansion kernel.
+     */
     cudaError_t rc =
         cudaMemcpyToSymbol(
             DEVICE_SBOX,
@@ -1322,7 +1417,7 @@ int lmcache_gpu_aes128gcm_key_create(
         );
 
     if (rc != cudaSuccess) {
-        delete h;
+        cleanup_failure();
         return LMCACHE_GPU_AESGCM_ERR_CUDA;
     }
 
@@ -1333,7 +1428,7 @@ int lmcache_gpu_aes128gcm_key_create(
         );
 
     if (rc != cudaSuccess) {
-        delete h;
+        cleanup_failure();
         return LMCACHE_GPU_AESGCM_ERR_ALLOC;
     }
 
@@ -1344,38 +1439,129 @@ int lmcache_gpu_aes128gcm_key_create(
         );
 
     if (rc != cudaSuccess) {
-        cudaFree(h->d_round_keys);
-        delete h;
+        cleanup_failure();
+        return LMCACHE_GPU_AESGCM_ERR_ALLOC;
+    }
+
+    /*
+     * This allocation exists only during provisioning.
+     *
+     * In the target deployment the source pointer is inside the
+     * TDX guest.  With H100 CC-On, NVIDIA transparently protects
+     * this H2D transfer.
+     */
+    rc =
+        cudaMalloc(
+            &d_raw_key,
+            16
+        );
+
+    if (rc != cudaSuccess) {
+        cleanup_failure();
         return LMCACHE_GPU_AESGCM_ERR_ALLOC;
     }
 
     rc =
         cudaMemcpy(
-            h->d_round_keys,
-            round_keys,
-            AES_ROUND_KEY_BYTES,
+            d_raw_key,
+            key,
+            16,
             cudaMemcpyHostToDevice
         );
 
     if (rc != cudaSuccess) {
-        cudaFree(h->d_h_pow2);
-        cudaFree(h->d_round_keys);
-        delete h;
+        cleanup_failure();
         return LMCACHE_GPU_AESGCM_ERR_CUDA;
     }
 
-    init_hash_key_kernel<<<1, 1>>>(
+    /*
+     * Raw K_store has now crossed the TDX -> H100 provisioning
+     * boundary.  Expand it inside H100 protected GPU memory.
+     */
+    expand_aes128_key_kernel<<<
+        1,
+        1
+    >>>(
+        d_raw_key,
+        h->d_round_keys
+    );
+
+    if (
+        cudaPeekAtLastError()
+        != cudaSuccess
+    ) {
+        cleanup_failure();
+        return LMCACHE_GPU_AESGCM_ERR_CUDA;
+    }
+
+    /*
+     * Erase the temporary raw K_store immediately after the key
+     * expansion kernel in the same default-stream order.
+     */
+    zeroize_bytes_kernel<<<
+        1,
+        32
+    >>>(
+        d_raw_key,
+        16
+    );
+
+    if (
+        cudaPeekAtLastError()
+        != cudaSuccess
+    ) {
+        cleanup_failure();
+        return LMCACHE_GPU_AESGCM_ERR_CUDA;
+    }
+
+    /*
+     * GHASH's H and its power table are also derived inside the GPU.
+     */
+    init_hash_key_kernel<<<
+        1,
+        1
+    >>>(
         h->d_round_keys,
         h->d_h_pow2
     );
 
+    if (
+        cudaPeekAtLastError()
+        != cudaSuccess
+    ) {
+        cleanup_failure();
+        return LMCACHE_GPU_AESGCM_ERR_CUDA;
+    }
+
+    /*
+     * key_create() is intentionally synchronous.
+     *
+     * When it returns successfully:
+     *
+     *   - GPU round keys are ready;
+     *   - GHASH key state is ready;
+     *   - the temporary GPU raw key has been overwritten.
+     *
+     * This lets the caller safely erase its TDX-side mutable
+     * K_store buffer immediately after key_create returns.
+     */
     rc =
         cudaDeviceSynchronize();
 
     if (rc != cudaSuccess) {
-        cudaFree(h->d_h_pow2);
-        cudaFree(h->d_round_keys);
-        delete h;
+        cleanup_failure();
+        return LMCACHE_GPU_AESGCM_ERR_CUDA;
+    }
+
+    rc =
+        cudaFree(
+            d_raw_key
+        );
+
+    d_raw_key = nullptr;
+
+    if (rc != cudaSuccess) {
+        cleanup_failure();
         return LMCACHE_GPU_AESGCM_ERR_CUDA;
     }
 
@@ -1405,25 +1591,135 @@ int lmcache_gpu_aes128gcm_key_destroy(
         h->device
     );
 
-    if (h->d_nodes_a != nullptr) {
-        cudaFree(h->d_nodes_a);
+    int status =
+        LMCACHE_GPU_AESGCM_OK;
+
+    /*
+     * Wipe all key-derived GPU state before releasing allocations.
+     */
+    if (
+        h->d_nodes_a != nullptr
+        && h->node_capacity != 0
+    ) {
+        if (
+            cudaMemset(
+                h->d_nodes_a,
+                0,
+                h->node_capacity
+                    * sizeof(GHashNode)
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
     }
 
-    if (h->d_nodes_b != nullptr) {
-        cudaFree(h->d_nodes_b);
+    if (
+        h->d_nodes_b != nullptr
+        && h->node_capacity != 0
+    ) {
+        if (
+            cudaMemset(
+                h->d_nodes_b,
+                0,
+                h->node_capacity
+                    * sizeof(GHashNode)
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
     }
 
     if (h->d_h_pow2 != nullptr) {
-        cudaFree(h->d_h_pow2);
+        if (
+            cudaMemset(
+                h->d_h_pow2,
+                0,
+                sizeof(Block128) * 64
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
     }
 
     if (h->d_round_keys != nullptr) {
-        cudaFree(h->d_round_keys);
+        if (
+            cudaMemset(
+                h->d_round_keys,
+                0,
+                AES_ROUND_KEY_BYTES
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
+    }
+
+    if (
+        cudaDeviceSynchronize()
+        != cudaSuccess
+    ) {
+        status =
+            LMCACHE_GPU_AESGCM_ERR_CUDA;
+    }
+
+    if (h->d_nodes_a != nullptr) {
+        if (
+            cudaFree(
+                h->d_nodes_a
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
+    }
+
+    if (h->d_nodes_b != nullptr) {
+        if (
+            cudaFree(
+                h->d_nodes_b
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
+    }
+
+    if (h->d_h_pow2 != nullptr) {
+        if (
+            cudaFree(
+                h->d_h_pow2
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
+    }
+
+    if (h->d_round_keys != nullptr) {
+        if (
+            cudaFree(
+                h->d_round_keys
+            )
+            != cudaSuccess
+        ) {
+            status =
+                LMCACHE_GPU_AESGCM_ERR_CUDA;
+        }
     }
 
     delete h;
 
-    return LMCACHE_GPU_AESGCM_OK;
+    return status;
 }
 
 

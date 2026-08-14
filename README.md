@@ -1,144 +1,174 @@
 # ConfKV
 
-ConfKV is a research prototype for confidential persistent KV-cache
-protection in LLM serving. It is built on top of LMCache and explores
-where cryptographic protection should be placed across CPU and GPU
-execution paths.
+ConfKV is a research prototype for protecting persistent LLM KV cache
+with authenticated encryption. It is built on LMCache and supports
+CPU-side and GPU-side AES-GCM data paths.
 
-## Motivation
+The current repository focuses on the non-confidential-computing data
+plane. TDX attestation and protected TDX-to-GPU-CC key establishment
+are reserved as a separate control-plane extension.
 
-Persistent KV caching introduces a data-lifecycle problem in
-confidential LLM serving: KV state may move from confidential GPU
-memory into CPU memory and persistent storage.
+## Architecture
 
-ConfKV studies cryptographic endpoint placement for this path,
-including CPU-side and GPU-side AES-GCM protection.
+ConfKV separates key establishment from KV-cache encryption.
 
-The current GPU design targets the following persistent-store path:
+```mermaid
+flowchart TD
+    subgraph Control["Control plane"]
+        TDX["TDX secret and attestation"]
+        Channel["Protected key channel"]
+        Provider["TdxGpuCcKeyProvider"]
+        TDX -. future .-> Channel
+        Channel -. future .-> Provider
+    end
 
-    GPU plaintext KV
-        |
-        v
-    GPU AES-GCM seal
-        |
-        v
-    GPU persistent ciphertext
-        |
-        v
-    D2H
-        |
-        v
-    CPU / storage relay
-        |
-        v
-    persistent storage
+    subgraph Data["Implemented data plane"]
+        Dev["DevKeyProvider"]
+        Key["GPU-resident AES key"]
+        Plain["GPU plaintext KV"]
+        Seal["GPU AES-GCM seal"]
+        Host["Pinned CPU ciphertext"]
+        Store["Persistent storage"]
+        Open["GPU authenticate and open"]
 
-The CPU continues to manage cache metadata, ObjectKeys, lookup,
-reservation, and storage decisions. GPU cryptography is only applied
-to KV objects selected for persistence.
+        Dev --> Key
+        Plain --> Seal
+        Key --> Seal
+        Seal --> Host
+        Host --> Store
+        Store --> Host
+        Host --> Open
+        Key --> Open
+        Open --> Plain
+    end
+```
 
-## Current Status
+`KeyProvider` is the boundary between these two planes:
 
-### CPU
+- `DevKeyProvider` reads a raw 16-byte test key and provisions GPU key
+  handles. It is used for current functional and performance tests.
+- `TdxGpuCcKeyProvider` is fail-closed until the attested TDX and GPU
+  CC provisioning path is implemented.
 
-- LMCache stock AES-GCM baseline
-- optimized OpenSSL EVP AES-128-GCM backend
-- stock/native interoperability
-- wrong-key and tamper rejection
-- failed-open zeroization
-- LMCache serde backend switching
-- CPU microbenchmarks
+The persistent store only receives AES-GCM frames:
 
-### GPU
+```text
+[version | 12-byte IV | ciphertext | 16-byte authentication tag]
+```
+
+On load, ConfKV authenticates the frame before publishing plaintext KV
+back to the inference engine. Authentication failure prevents KV
+scatter and zeroizes the failed output.
+
+## Current Scope
 
 Implemented:
 
-- CUDA AES-128-GCM core
-- LMCache-compatible persistent frame:
-  `[version | 12-byte IV | ciphertext | 16-byte tag]`
-- asynchronous seal/open C ABI
-- authentication-gated open
-- failed-authentication zeroization
-- Python ctypes binding
-- CUDA runtime test harness
-- NVIDIA Hopper (`sm_90`) compilation
-- ABI tests
+- CPU AES-128-GCM baseline and optimized native backend;
+- GPU AES-128-GCM seal/open;
+- GPU/CPU frame interoperability;
+- authentication failure and tamper rejection;
+- naive synchronous GPU data path;
+- optimized batched and streamed GPU data path;
+- LMCache GPU-to-CPU-to-storage integration;
+- persistent L2 reload and authenticated GPU restore;
+- 4-GPU/8-CPU Qwen end-to-end experiment runner.
 
-Not yet runtime-validated:
+Not yet implemented or validated:
 
-- GPU seal -> reference CPU AES-GCM interoperability
-- reference CPU AES-GCM -> GPU open interoperability
-- GPU tamper/wrong-key security gates
-- H100 performance
-- LMCache persistent GPU data-path integration
+- TDX secret generation and remote attestation;
+- protected TDX-to-GPU-CC key transfer;
+- GPU CC execution;
+- end-to-end security against a malicious host.
 
-The GPU backend should therefore currently be considered
-**implemented and build/ABI validated, but not yet H100 runtime
-validated**.
+Results produced without TDX and GPU CC must be described as
+**non-CC encrypted data-path performance**, not as end-to-end
+confidential-computing results.
 
-## Upstream
+## Experiment Cases
 
-ConfKV is based on:
+| Case | Description |
+|---|---|
+| `baseline` | Native LMCache without KV encryption |
+| `opt_cpu` | CPU AES-128-GCM with the native OpenSSL backend |
+| `confkv_naive` | GPU AES-GCM with one slot and synchronous per-chunk execution |
+| `confkv_optimized` | GPU AES-GCM with batching, multiple slots and CUDA stream overlap |
 
-- Project: LMCache
-- Repository: `LMCache/LMCache`
-- Baseline commit:
-  `3031f71e66f8872f8c763544e6ad4a654e566629`
-
-The ConfKV-modified LMCache runtime is included as the `LMCache/`
-Git submodule. The ConfKV repository pins the submodule to an exact
-commit for reproducibility.
+The naive and optimized cases use the same AES-GCM frame, key and
+workload. Their difference is execution scheduling, allowing the
+benefit of ConfKV's data-path optimizations to be isolated.
 
 ## Repository Layout
 
-    LMCache/
-        Git submodule containing the ConfKV-modified LMCache runtime
+```text
+LMCache/
+    Pinned ConfKV-modified LMCache runtime
 
-    experiments/gpu_kv_seal/
-        gpu/
-            CUDA AES-GCM implementation and Python bindings
-        native/
-            optimized CPU/OpenSSL AES-GCM implementation
-        scripts/
-            correctness, security, interoperability, and benchmark tools
-        configs/
-            experiment configurations
+experiments/gpu_kv_seal/
+    gpu/       CUDA AES-GCM implementation and Python binding
+    native/    Native CPU/OpenSSL AES-GCM implementation
+    scripts/   Correctness, security and performance experiments
+    configs/   Experiment configurations
+```
 
-## Clone and Environment
+The original LMCache baseline commit is recorded in:
 
-Clone ConfKV together with its pinned LMCache runtime:
+```text
+experiments/gpu_kv_seal/BASELINE_COMMIT
+```
 
-    git clone --recursive https://github.com/MountVeil/ConfKV.git
-    cd ConfKV
-    source env.sh
+## Quick Start
 
-For an existing clone:
+Clone the repository and initialize the LMCache submodule:
 
-    git submodule update --init --recursive
-    source env.sh
+```bash
+git clone --recursive ssh://git@ssh.github.com:443/MountVeil/ConfKV.git
+cd ConfKV
+git submodule update --init --recursive
+source .venv/bin/activate
+source env.sh
+```
 
-The ConfKV superproject pins `LMCache/` to an exact commit. The
-`branch = confkv` entry in `.gitmodules` indicates the development
-branch, but reproducible checkouts always use the commit recorded by
-the ConfKV superproject.
+Build the native CPU and GPU libraries:
 
-## GPU Correctness Gates
+```bash
+./experiments/gpu_kv_seal/native/build.sh
+./experiments/gpu_kv_seal/gpu/build.sh
+```
 
-Once an H100 is available to CUDA:
+Run the focused unit tests:
 
-    ./experiments/gpu_kv_seal/scripts/run_gpu_gates.sh
+```bash
+pytest -q \
+  LMCache/tests/v1/confkv/test_key_provider.py \
+  LMCache/tests/v1/confkv/test_gpu_crypto.py \
+  LMCache/tests/v1/confkv/test_store_abort.py
+```
 
-After all correctness/security gates pass:
+Run the non-CC GPU data-plane gates:
 
-    python3 experiments/gpu_kv_seal/scripts/bench_gpu_aesgcm.py
+```bash
+./experiments/gpu_kv_seal/scripts/run_gpu_gates.sh
+```
+
+Run the complete 4-GPU/8-CPU Qwen experiment:
+
+```bash
+python3 experiments/gpu_kv_seal/scripts/run_qwen_e2e_4g8c.py \
+  --repo "$PWD" \
+  --model /data/models/Qwen3-8B \
+  --gpus 0,1,2,3 \
+  --cpus 0-7 \
+  --cases baseline opt_cpu confkv_naive confkv_optimized
+```
+
+See [experiments/gpu_kv_seal/README.md](experiments/gpu_kv_seal/README.md)
+for environment preparation, development-key creation, experiment
+parameters and result-file descriptions.
 
 ## License
 
-This repository contains a derivative of LMCache, distributed under
-the Apache License 2.0.
+This repository contains a derivative of LMCache and is distributed
+under the Apache License 2.0.
 
-See:
-
-- `LICENSE`
-- `THIRD_PARTY.md`
-- `MODIFICATIONS.md`
+See `LICENSE`, `THIRD_PARTY.md` and `MODIFICATIONS.md`.
