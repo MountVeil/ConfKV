@@ -159,6 +159,8 @@ python3 experiments/gpu_kv_seal/scripts/run_qwen_e2e_4g8c.py \
   --model /data/models/Qwen3-8B \
   --gpus 0,1,2,3 \
   --cpus 0-7 \
+  --cpu-key "$HOME/.confkv-secrets/master_key" \
+  --gpu-key "$HOME/.confkv-secrets/k_store" \
   --cases baseline opt_cpu confkv_naive confkv_optimized
 ```
 
